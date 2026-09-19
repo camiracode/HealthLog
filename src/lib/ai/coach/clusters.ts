@@ -2,8 +2,8 @@
  * v1.7.0 — cluster taxonomy for the Coach snapshot.
  *
  * The Coach used to ship a fixed five domains (BP, weight, pulse, mood,
- * medication compliance). Everything else the user stores — Apple
- * Health activity, body composition, glucose, workouts, mobility, the
+ * medication compliance). Everything else the user stores — Apple Health
+ * activity, body composition, glucose, workouts, mobility, the
  * environmental-exposure series — was either wired-but-default-off or
  * never mapped at all. This module is the single source of truth for:
  *
@@ -88,8 +88,12 @@ export const CLUSTER_PRIORITY: ReadonlyArray<CoachDataCluster> = [
   "medication",
   "cardio",
   "glucose",
-  "body",
+  // Sleep sits with glucose so glucose×sleep correlations survive the
+  // snapshot soft-cap (body/mood/activity shed first). A prior ordering
+  // put body above sleep and the 24k-char budget fully omitted sleep
+  // whenever CGM volume was high.
   "sleep",
+  "body",
   "mood",
   "activity",
   "workouts",

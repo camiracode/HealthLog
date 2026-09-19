@@ -15,6 +15,7 @@
  */
 import {
   reconstructSleepNights,
+  type SleepNight,
   type SleepStageRow,
 } from "@/lib/analytics/sleep-night";
 import {
@@ -27,7 +28,7 @@ import {
 } from "@/lib/insights/derived/sleep-rhythm";
 import { annotate } from "@/lib/logging/context";
 import type { ReferenceMetric } from "@/lib/reference-ranges";
-import { bucketWeekly, tzWeekday } from "../snapshot-series";
+import { isoWeekKey, tzWeekday } from "../snapshot-series";
 import type {
   CoachProvenance,
   CoachProvenanceMetric,
@@ -58,6 +59,91 @@ interface SleepTimelineBlockContext {
  * stage; the duration timeline is built from the same rows summed per
  * night (one night = the sum of its per-stage rows).
  */
+
+/** Stages Coach should narrate for cause/effect (exclude IN_BED envelope). */
+const COACH_SLEEP_STAGE_KEYS = ["CORE", "DEEP", "REM", "AWAKE"] as const;
+
+function meanRounded(values: number[]): number | undefined {
+  if (values.length === 0) return undefined;
+  return Math.round(values.reduce((s, v) => s + v, 0) / values.length);
+}
+
+/**
+ * Weekly sleep buckets with mean asleep + mean per-stage minutes.
+ * Built from ALL reconstructed nights (not only pre-recent) so soft-cap
+ * shedding of `timeline.recent` still leaves Libre-week stage mix on
+ * `timeline.weekly` (sleep retains weekly under the char budget).
+ */
+function bucketWeeklySleepWithStages(
+  nights: readonly SleepNight[],
+  tz: string,
+): Array<Record<string, unknown>> {
+  type Acc = { asleep: number[]; stages: Record<string, number[]> };
+  const grouped = new Map<string, Acc>();
+  for (const n of nights) {
+    const key = isoWeekKey(n.measuredAt, tz);
+    let acc = grouped.get(key);
+    if (!acc) {
+      acc = {
+        asleep: [],
+        stages: { core: [], deep: [], rem: [], awake: [] },
+      };
+      grouped.set(key, acc);
+    }
+    acc.asleep.push(n.asleepMinutes);
+    for (const stage of COACH_SLEEP_STAGE_KEYS) {
+      const mins = n.stages[stage];
+      if (typeof mins === "number" && Number.isFinite(mins)) {
+        acc.stages[stage.toLowerCase()]!.push(mins);
+      }
+    }
+  }
+  return Array.from(grouped.entries())
+    .map(([weekISO, acc]) => {
+      const stages: Record<string, number> = {};
+      for (const [k, vals] of Object.entries(acc.stages)) {
+        const m = meanRounded(vals);
+        if (m !== undefined) stages[k] = m;
+      }
+      const meanAsleep = meanRounded(acc.asleep) ?? 0;
+      return {
+        weekISO,
+        // `mean` kept for parity with other weekly value buckets (minutes).
+        mean: meanAsleep,
+        meanAsleepMinutes: meanAsleep,
+        meanAsleepHours: Math.round((meanAsleep / 60) * 10) / 10,
+        count: acc.asleep.length,
+        ...(Object.keys(stages).length > 0 ? { stages } : {}),
+      };
+    })
+    .sort((a, b) => String(a.weekISO).localeCompare(String(b.weekISO)));
+}
+
+function meanStagesAcrossNights(
+  nights: readonly SleepNight[],
+): Record<string, number> | undefined {
+  const buckets: Record<string, number[]> = {
+    core: [],
+    deep: [],
+    rem: [],
+    awake: [],
+  };
+  for (const n of nights) {
+    for (const stage of COACH_SLEEP_STAGE_KEYS) {
+      const mins = n.stages[stage];
+      if (typeof mins === "number" && Number.isFinite(mins)) {
+        buckets[stage.toLowerCase()]!.push(mins);
+      }
+    }
+  }
+  const out: Record<string, number> = {};
+  for (const [k, vals] of Object.entries(buckets)) {
+    const m = meanRounded(vals);
+    if (m !== undefined) out[k] = m;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export function buildSleepTimelineBlock(
   ctx: Readonly<SleepTimelineBlockContext>,
 ): void {
@@ -115,13 +201,32 @@ export function buildSleepTimelineBlock(
         return row;
       })
       .sort((a, b) => String(a.date).localeCompare(String(b.date)));
-    const olderNights = nights
-      .filter((n) => n.measuredAt < recentCutoff)
-      .map((n) => ({ measuredAt: n.measuredAt, value: n.asleepMinutes }));
+    // Weekly buckets cover ALL nights (not only pre-recent) and carry
+    // mean CORE/DEEP/REM/AWAKE minutes. Soft-cap drops timeline.recent
+    // first but retains sleep weekly — so Libre-week stage mix survives.
+    const weeklyWithStages = bucketWeeklySleepWithStages(nights, userTz);
+    const meanStageMinutes = meanStagesAcrossNights(nights);
+    // Aggregate survives the soft-cap degrader after timeline.recent /
+    // timeline.weekly are shed — without it, pass-3 replaced the whole
+    // sleep block with "omitted" and Coach claimed it had no sleep while
+    // correlating against glucose weeks that still had nightly data.
+    const allAsleep = nights.map((n) => n.asleepMinutes);
+    const meanAsleepMinutes =
+      allAsleep.reduce((s, v) => s + v, 0) / allAsleep.length;
+    const measuredAts = nights.map((n) => n.measuredAt).sort();
     snapshot.sleep = {
+      aggregate: {
+        nights: nights.length,
+        meanAsleepMinutes: Math.round(meanAsleepMinutes),
+        meanAsleepHours:
+          Math.round((meanAsleepMinutes / 60) * 10) / 10,
+        firstNight: measuredAts[0],
+        lastNight: measuredAts[measuredAts.length - 1],
+        ...(meanStageMinutes ? { meanStages: meanStageMinutes } : {}),
+      },
       timeline: {
         recent: recentNights,
-        weekly: bucketWeekly(olderNights, userTz),
+        weekly: weeklyWithStages,
       },
     };
     metrics.add("sleep");
